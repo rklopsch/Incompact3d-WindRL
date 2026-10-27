@@ -64,6 +64,13 @@ message(STATUS "SmartRedis found: ${SMARTREDIS_FOUND}")
 
 target_link_libraries(xcompact3d PRIVATE decomp2d)
 
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_custom_target(windrl_solver_manifest ALL
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/solver_manifest.py
+          --binary $<TARGET_FILE:xcompact3d>
+  DEPENDS xcompact3d
+  VERBATIM)
+
 if (SMARTREDIS_FOUND)
     target_link_libraries(xcompact3d PRIVATE smartredis)
     target_link_libraries(xcompact3d PRIVATE smartredis-fortran)

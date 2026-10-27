@@ -258,7 +258,7 @@ contains
     use var, only : nzmsize
     use var, only : itime
     use var, only : numscalar, nrhotime, npress
-    use var, only : umean, vmean, wmean 
+   use var, only : umean, vmean, wmean, pmean
 
     use turbine, only : turbine_output
     use probes, only : write_probes, write_probes_smartredis
@@ -287,7 +287,7 @@ contains
 
     if (iturbine.ne.0) then
       if (mod(itime,icontrolfreq)==0) then
-          call write_probes_smartredis(umean, vmean, wmean)
+          call write_probes_smartredis(umean, vmean, wmean, pmean)
           call init_statistic()
       end if
       call turbine_output()

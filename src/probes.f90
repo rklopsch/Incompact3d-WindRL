@@ -407,19 +407,27 @@ contains
   !
   ! This subroutine is used to monitor velocity, scalar(s) and pressure
   !
-  subroutine write_probes_smartredis(ux1,uy1,uz1)
+   subroutine write_probes_smartredis(ux1,uy1,uz1,pressure_mean)
 
     use actuator_disc_model, only: client
     use iso_c_binding
-    use param, only : t,instance
+   use param, only : instance, initstat, itime
+   use variables, only : nstat
+   use decomp_2d, only : xstS, xenS
     use MPI
 
-    real(mytype),intent(in),dimension(xstart(1):xend(1),xstart(2):xend(2),xstart(3):xend(3)) :: ux1, uy1, uz1
-    real(kind=c_double), dimension(3) :: probe
+   real(mytype),intent(in),dimension(xstS(1):xenS(1),xstS(2):xenS(2),xstS(3):xenS(3)) :: ux1, uy1, uz1
+   real(mytype),intent(in),dimension(xstS(1):xenS(1),xstS(2):xenS(2),xstS(3):xenS(3)) :: pressure_mean
+   real(kind=c_double), dimension(4) :: probe
     integer :: i, result, ierr
     character(len=12) :: name_prefix, name_suffix
 
     if (nprobes<=0) return
+
+   if (nstat /= 1 .or. any(xstS /= xstart) .or. any(xenS /= xend) .or. itime < initstat) then
+      write(*,*) 'SmartRedis mean probes require nstat=1 and statistics started before control output'
+      call MPI_ABORT(MPI_COMM_WORLD, 1, ierr)
+   endif
 
     write(name_prefix, '(I0)') instance
 
@@ -429,6 +437,7 @@ contains
             probe(1) = ux1(nxprobes(i), nyprobes(i), nzprobes(i))
             probe(2) = uy1(nxprobes(i), nyprobes(i), nzprobes(i))
             probe(3) = uz1(nxprobes(i), nyprobes(i), nzprobes(i))
+            probe(4) = pressure_mean(nxprobes(i), nyprobes(i), nzprobes(i))
             result = client%put_tensor(trim(name_prefix)//'_probe_'//trim(name_suffix), probe, shape(probe))
             if (result /= 0) then
                 write(*,*) 'SmartRedis write failed'
@@ -436,6 +445,8 @@ contains
             endif
         end if
     end do
+
+   call MPI_BARRIER(MPI_COMM_WORLD, ierr)
 
 !    Rather than passing individual probes could pass them all but need to collect from ranks
 !    call MPI_GATHERV(LocalProbes, local_probe_size, c_double, &
