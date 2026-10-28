@@ -1,3 +1,4 @@
+
 !Copyright (c) 2012-2022, Xcompact3d
 !This file is part of Xcompact3d (xcompact3d.com)
 !SPDX-License-Identifier: BSD 3-Clause
@@ -8,8 +9,6 @@ module actuator_disc_model
     use decomp_2d_constants, only: mytype, real_type
     use actuator_line_model_utils 
     use airfoils
-    use iso_c_binding
-    use smartredis_client, only : client_type
 
     implicit none
     
@@ -30,13 +29,23 @@ type ActuatorDiscType
     real(mytype) :: Udisc_ave=0.0_mytype
     real(mytype) :: Power_ave=0.0_mytype
     real(mytype) :: Thrust_ave=0.0_mytype
+    real(mytype) :: PertAmp             ! Perturbation amplitude (fraction of thrust)
+    real(mytype) :: PertFreq            ! Perturbation frequency
+    integer :: PertDir                  ! Perturbation direction (0: axial edge forcing, 1: transverse sway)
+    integer :: PertMode                 ! Azimuthal mode of the axial edge forcing (0: pulsing, 1: rocking, ...)
+    real(mytype) :: PertWidth           ! Radial width of the axial edge forcing (fraction of D)
+    real(mytype) :: PertPhase           ! Temporal phase of the perturbation
+    real(mytype) :: PertAzim            ! Azimuthal orientation of the perturbation
+    real(mytype) :: PertVec(3)          ! In-plane direction of the transverse perturbation
+    real(mytype) :: PertBand            ! Spectral width (FWHM) of the perturbation, 0 for a pure sine
+    real(mytype) :: PertTheta           ! Current phase of the perturbation
+    real(mytype) :: PertTime=-1.0_mytype ! Time at which PertTheta was last updated (<0: not yet set)
+    integer(8) :: RngState              ! State of the perturbation random number generator
 end type ActuatorDiscType
 
     type(ActuatorDiscType), allocatable, save :: ActuatorDisc(:)
-    type(client_type) :: client
-    integer, save :: Nad                ! Number of the actuator disc turbines
-    character(len=12), save :: name_prefix
-
+    integer, save :: Nad                ! Number of the actuator disc turbines 
+    real(mytype), allocatable, save :: GammaPert(:,:,:,:) ! Spatial shape of the edge perturbation
 
 contains
 
@@ -47,7 +56,7 @@ contains
     !*******************************************************************************
         
       use var, only: GammaDisc
-      use param, only: dx,dy,dz,istret,irestart,itime,iturboutput,initstat,icontrolfreq,instance
+      use param, only: dx,dy,dz,istret,irestart,itime,iturboutput,initstat
       use decomp_2d
       use decomp_2d_io
       use MPI
@@ -56,26 +65,13 @@ contains
       integer, intent(in) :: Ndiscs
       character(len=100), intent(in) :: admCoords
       character(1000) :: ReadLine
-      real(mytype) :: GammaDisc_tot,GammaDisc_partial
-      integer :: idisc,i,j,k,ierr,code,result
+      real(mytype) :: GammaDisc_tot
+      integer :: idisc,i,j,k,ierr,code,ios
       real :: temp
+      real(mytype) :: dummy(8),pert_real(6)
+      integer :: pert_int(2)
       real(mytype) :: xmesh,ymesh,zmesh,deltax,deltay,deltaz,deltan,deltar,disc_thick,hgrid,projected_x,projected_y,projected_z
-
-!      if ((icontrolfreq>=1).and.(nrank==0)) then
-      if (icontrolfreq>=1) then
-          if (nrank==0) then
-              write(*,*) '==========================================================='
-              write(*,*) 'Initialising smartredis database'
-              write(*,*) '==========================================================='
-          end if
-          result = client%initialize("smartredis_database")
-          write(name_prefix, '(I0)') instance
-          if (nrank==0) write(*,*) 'instance = ', trim(name_prefix)
-          if (result /= 0) then
-              write(*,*) 'SmartRedis initialization failed'
-              call MPI_ABORT(MPI_COMM_WORLD, result, ierr)
-          endif
-      end if
+      real(mytype) :: normal(3),e1(3),e2(3),pvec(3),theta,pert_width
 
       ! ADM not yet set-up for stretched grids
       if (istret/=0) then
@@ -108,20 +104,130 @@ contains
             ActuatorDisc(idisc)%RotN(2)=sin(ActuatorDisc(idisc)%TiltAng*conrad)
             ActuatorDisc(idisc)%RotN(3)=sin(ActuatorDisc(idisc)%YawAng*conrad)  
             ActuatorDisc(idisc)%Area=pi*(ActuatorDisc(idisc)%D**2._mytype)/4._mytype
+            ! Optional perturbation columns: PertAmp PertFreq PertDir PertMode PertWidth PertPhase[deg] PertAzim[deg] [PertBand]
+            ActuatorDisc(idisc)%PertAmp=0.
+            ActuatorDisc(idisc)%PertFreq=0.
+            ActuatorDisc(idisc)%PertDir=0
+            ActuatorDisc(idisc)%PertMode=1
+            ActuatorDisc(idisc)%PertWidth=0.1_mytype
+            ActuatorDisc(idisc)%PertPhase=0.
+            ActuatorDisc(idisc)%PertAzim=0.
+            ActuatorDisc(idisc)%PertBand=0.
+            ! Same seed on all ranks; differs between discs and after a restart
+            ActuatorDisc(idisc)%RngState=88172645463325252_8+1000003_8*idisc+itime
+            read(Readline,*,iostat=ios) dummy,pert_real(1),pert_real(2),pert_int(1),pert_int(2),pert_real(3),pert_real(4),pert_real(5),&
+                                        pert_real(6)
+            if (ios==0) then
+               ActuatorDisc(idisc)%PertBand=pert_real(6)
+            else
+               read(Readline,*,iostat=ios) dummy,pert_real(1),pert_real(2),pert_int(1),pert_int(2),pert_real(3),pert_real(4),pert_real(5)
+            endif
+            if (ios==0) then
+               ActuatorDisc(idisc)%PertAmp=pert_real(1)
+               ActuatorDisc(idisc)%PertFreq=pert_real(2)
+               ActuatorDisc(idisc)%PertDir=pert_int(1)
+               ActuatorDisc(idisc)%PertMode=pert_int(2)
+               ActuatorDisc(idisc)%PertWidth=pert_real(3)
+               ActuatorDisc(idisc)%PertPhase=pert_real(4)*conrad
+               ActuatorDisc(idisc)%PertAzim=pert_real(5)*conrad
+            endif
+            if (nrank==0) then
+               write(*,*) 'Disc ', idisc, ' perturbation: amp, freq, dir, mode, width, phase[deg], azim[deg], band = ', &
+                          ActuatorDisc(idisc)%PertAmp,ActuatorDisc(idisc)%PertFreq,ActuatorDisc(idisc)%PertDir,&
+                          ActuatorDisc(idisc)%PertMode,ActuatorDisc(idisc)%PertWidth,&
+                          ActuatorDisc(idisc)%PertPhase/conrad,ActuatorDisc(idisc)%PertAzim/conrad,ActuatorDisc(idisc)%PertBand
+            endif
          enddo
          close(15)
           
          ! Compute Gamma
-         call actuator_disc_model_compute_gamma(Nad,admCoords)
+         GammaDisc=0.0
+         if (any(ActuatorDisc%PertAmp/=0..and.ActuatorDisc%PertDir==0)) then
+            allocate(GammaPert(xsize(1),xsize(2),xsize(3),Nad))
+            GammaPert=0.0
+         endif
+         do idisc=1,Nad
+            GammaDisc_tot=0.0
+            ! Define the disc thickness 
+            hgrid=sqrt((dx*actuatordisc(idisc)%RotN(1))**2+&
+                       (dy*actuatordisc(idisc)%RotN(2))**2+&
+                       (dz*(-actuatordisc(idisc)%RotN(3)))**2)
+            disc_thick=max(actuatordisc(idisc)%D/8.0,hgrid*1.5)
+            pert_width=max(actuatordisc(idisc)%PertWidth*actuatordisc(idisc)%D,hgrid*1.5)
+            ! In-plane orthonormal basis (e1,e2) used to define the azimuthal angle
+            normal=[actuatordisc(idisc)%RotN(1),actuatordisc(idisc)%RotN(2),-actuatordisc(idisc)%RotN(3)]
+            if (abs(normal(2))<0.9) then
+               e1=[0._mytype,1._mytype,0._mytype]
+            else
+               e1=[0._mytype,0._mytype,1._mytype]
+            endif
+            e1=e1-dot_product(e1,normal)*normal
+            e1=e1/sqrt(dot_product(e1,e1))
+            e2=[normal(2)*e1(3)-normal(3)*e1(2),normal(3)*e1(1)-normal(1)*e1(3),normal(1)*e1(2)-normal(2)*e1(1)]
+            actuatordisc(idisc)%PertVec=cos(actuatordisc(idisc)%PertAzim)*e1+sin(actuatordisc(idisc)%PertAzim)*e2
+            do k=1,xsize(3)
+               zmesh=(xstart(3)+k-1-1)*dz
+               do j=1,xsize(2)
+                  ymesh=(xstart(2)+j-1-1)*dy
+                  do i=1,xsize(1)
+                     xmesh=(xstart(1)+i-1-1)*dx
+                     ! Compute distance of mesh node to centre of disc 
+                     ! [Quick fix to simulate a plate: set deltaz to zero and modify area]
+                     deltax=xmesh-actuatordisc(idisc)%COR(1)
+                     deltay=ymesh-actuatordisc(idisc)%COR(2)
+                     deltaz=zmesh-actuatordisc(idisc)%COR(3)
+                     
+                     ! Projection of the vector (xmesh-COR(1), ymesh-COR(2), zmesh-COR(3)) onto the plane's normal vector (ROT(1), ROT(2), ROT(3))
+                     ! deltan: distance from the point (xmesh,ymesh,zmesh) to the wind turbine plane along the plane's normal vector
+                     deltan = deltax*actuatordisc(idisc)%RotN(1)+deltay*actuatordisc(idisc)%RotN(2)-deltaz*actuatordisc(idisc)%RotN(3)
+                     
+                     ! projected_: coordinates of the projected point
+                     projected_x = xmesh-deltan*  actuatordisc(idisc)%RotN(1)
+                     projected_y = ymesh-deltan*  actuatordisc(idisc)%RotN(2)
+                     projected_z = zmesh-deltan*(-actuatordisc(idisc)%RotN(3))
+                     
+                     ! deltar: distance between the wind turbine's centre and the projected point
+                     deltar = sqrt((projected_x-actuatordisc(idisc)%COR(1))**2+&
+                                   (projected_y-actuatordisc(idisc)%COR(2))**2+&
+                                   (projected_z-actuatordisc(idisc)%COR(3))**2)
+                    
+                     ! Compute Gamma [smearing using super-Gaussian functions, see also King et al. (2017) Wind Energ. Sci., 2, 115-131]
+                     GammaDisc(i,j,k,idisc)=exp( -(deltan/(disc_thick/2.0))**2.0 -(deltar/(actuatordisc(idisc)%D/2.0))**8.0 )
+                     GammaDisc_tot=GammaDisc_tot + GammaDisc(i,j,k,idisc) 
+
+                     ! Axial edge perturbation: ring at the disc edge modulated by a standing azimuthal mode
+                     if (actuatordisc(idisc)%PertAmp/=0..and.actuatordisc(idisc)%PertDir==0) then
+                        pvec=[projected_x-actuatordisc(idisc)%COR(1),&
+                              projected_y-actuatordisc(idisc)%COR(2),&
+                              projected_z-actuatordisc(idisc)%COR(3)]
+                        theta=atan2(dot_product(pvec,e2),dot_product(pvec,e1))
+                        GammaPert(i,j,k,idisc)=exp(-((deltar-actuatordisc(idisc)%D/2.0)/pert_width)**2.0)*&
+                                               cos(actuatordisc(idisc)%PertMode*(theta-actuatordisc(idisc)%PertAzim))
+                     endif
+                  enddo
+               enddo
+            enddo
+         
+            call MPI_ALLREDUCE(MPI_IN_PLACE,GammaDisc_tot,1,real_type,MPI_SUM,MPI_COMM_WORLD,ierr)
+            GammaDisc(:,:,:,idisc)=GammaDisc(:,:,:,idisc)/GammaDisc_tot
+            if (actuatordisc(idisc)%PertAmp/=0..and.actuatordisc(idisc)%PertDir==0) then
+               GammaPert(:,:,:,idisc)=GammaPert(:,:,:,idisc)*GammaDisc(:,:,:,idisc)
+            endif
+            !if (nrank==0) then
+            !   write(*,*) 'Disc thickness :', disc_thick
+            !   write(*,*) 'Total Gamma volume: ', GammaDisc_tot*dx*dy*dz
+            !   write(*,*) 'Approx. disc volume: ', actuatordisc(idisc)%Area*disc_thick
+            !endif
+         enddo
 
          if (irestart==1) then
              do idisc=1,Nad
                  open(15,File='disc'//trim(int2str(idisc))//'.adm', position="append", status='old', action='read')
                  backspace(15)
                  read(15,*) temp,temp,actuatordisc(idisc)%UF,actuatordisc(idisc)%Power,actuatordisc(idisc)%Thrust,actuatordisc(idisc)%Udisc_ave,actuatordisc(idisc)%Power_ave,actuatordisc(idisc)%Thrust_ave,temp,temp,temp
-                 actuatordisc(idisc)%Udisc_ave=actuatordisc(idisc)%Udisc_ave*(mod(itime-1,icontrolfreq)+1)
-                 actuatordisc(idisc)%Power_ave=actuatordisc(idisc)%Power_ave*(mod(itime-1,icontrolfreq)+1)
-                 actuatordisc(idisc)%Thrust_ave=actuatordisc(idisc)%Thrust_ave*(mod(itime-1,icontrolfreq)+1)
+                 actuatordisc(idisc)%Udisc_ave=actuatordisc(idisc)%Udisc_ave*(itime-initstat+1)
+                 actuatordisc(idisc)%Power_ave=actuatordisc(idisc)%Power_ave*(itime-initstat+1)
+                 actuatordisc(idisc)%Thrust_ave=actuatordisc(idisc)%Thrust_ave*(itime-initstat+1)
                  close(15)
              end do
          endif
@@ -134,158 +240,18 @@ contains
 
     !*******************************************************************************
     !
-    subroutine actuator_disc_model_read_input(Ndiscs,admCoords)
-    !
-    !*******************************************************************************
-
-      use var, only: GammaDisc
-      use param, only: dx,dy,dz
-      use decomp_2d
-      use decomp_2d_io
-      use MPI
-
-      implicit none
-      integer, intent(in) :: Ndiscs
-      character(len=100), intent(in) :: admCoords
-      character(1000) :: ReadLine
-      real(mytype) :: GammaDisc_tot,GammaDisc_partial
-      integer :: idisc,i,j,k,ierr,result
-      real(mytype) :: xmesh,ymesh,zmesh,deltax,deltay,deltaz,deltan,deltar,disc_thick,hgrid,projected_x,projected_y,projected_z
-      real(kind=c_double), dimension(Ndiscs) :: AllYawAngs
-      real(kind=c_double), dimension(1) :: controller_done
-
-      ! Specify the actuator discs
-      Nad=Ndiscs
-      controller_done(1) = 0
-      do while (int(controller_done(1)) == 0)
-          result = client%unpack_tensor(trim(name_prefix)//'_yaws_done', controller_done, shape(controller_done))
-      end do
-      if (result /= 0) then
-          write(*,*) 'SmartRedis read failed'
-          call MPI_ABORT(MPI_COMM_WORLD, result, ierr)
-      endif
-
-      if (Nad>0) then
-!          write(*,*) 'Reading yaw angles from smartredis database'
-          ! Read the disc data
-          ! Fill AllYawAngs with YawAng values from each ActuatorDisc
-          result = client%unpack_tensor(trim(name_prefix)//'_yaws', AllYawAngs, shape(AllYawAngs))
-          if (result /= 0) then
-              write(*,*) 'SmartRedis read failed'
-              call MPI_ABORT(MPI_COMM_WORLD, result, ierr)
-          endif
-          do idisc=1,Nad
-              ActuatorDisc(idisc)%YawAng = AllYawAngs(idisc)
-              ActuatorDisc(idisc)%RotN(1)=cos(ActuatorDisc(idisc)%YawAng*conrad)*cos(ActuatorDisc(idisc)%TiltAng*conrad)
-              ActuatorDisc(idisc)%RotN(2)=sin(ActuatorDisc(idisc)%TiltAng*conrad)
-              ActuatorDisc(idisc)%RotN(3)=sin(ActuatorDisc(idisc)%YawAng*conrad)
-          end do
-
-          ! Compute Gamma
-          call actuator_disc_model_compute_gamma(Nad,admCoords)
-
-      endif
-
-      return
-
-    end subroutine actuator_disc_model_read_input
-
-    !*******************************************************************************
-    !
-    subroutine actuator_disc_model_compute_gamma(Ndiscs,admCoords)
-    !
-    !*******************************************************************************
-
-      use var, only: GammaDisc
-      use param, only: dx,dy,dz
-      use decomp_2d
-      use decomp_2d_io
-      use MPI
-
-      implicit none
-      integer, intent(in) :: Ndiscs
-      character(len=100), intent(in) :: admCoords
-      real(mytype) :: GammaDisc_tot,GammaDisc_partial
-      integer :: idisc,i,j,k,ierr,result
-      real(mytype) :: xmesh,ymesh,zmesh,deltax,deltay,deltaz,deltan,deltar,disc_thick,hgrid,projected_x,projected_y,projected_z
-
-      ! Specify the actuator discs
-      Nad=Ndiscs
-
-      if (Nad>0) then
-
-         ! Compute Gamma
-         GammaDisc=0.0
-         do idisc=1,Nad
-            GammaDisc_partial=0.0
-            GammaDisc_tot=0.0
-            ! Define the disc thickness
-            hgrid=sqrt((dx*actuatordisc(idisc)%RotN(1))**2+&
-                       (dy*actuatordisc(idisc)%RotN(2))**2+&
-                       (dz*(-actuatordisc(idisc)%RotN(3)))**2)
-            disc_thick=max(actuatordisc(idisc)%D/8.0,hgrid*1.5)
-            do k=1,xsize(3)
-               zmesh=(xstart(3)+k-1-1)*dz
-               do j=1,xsize(2)
-                  ymesh=(xstart(2)+j-1-1)*dy
-                  do i=1,xsize(1)
-                     xmesh=(xstart(1)+i-1-1)*dx
-                     ! Compute distance of mesh node to centre of disc
-                     ! [Quick fix to simulate a plate: set deltaz to zero and modify area]
-                     deltax=xmesh-actuatordisc(idisc)%COR(1)
-                     deltay=ymesh-actuatordisc(idisc)%COR(2)
-                     deltaz=zmesh-actuatordisc(idisc)%COR(3)
-
-                     ! Projection of the vector (xmesh-COR(1), ymesh-COR(2), zmesh-COR(3)) onto the plane's normal vector (ROT(1), ROT(2), ROT(3))
-                     ! deltan: distance from the point (xmesh,ymesh,zmesh) to the wind turbine plane along the plane's normal vector
-                     deltan = deltax*actuatordisc(idisc)%RotN(1)+deltay*actuatordisc(idisc)%RotN(2)-deltaz*actuatordisc(idisc)%RotN(3)
-
-                     ! projected_: coordinates of the projected point
-                     projected_x = xmesh-deltan*  actuatordisc(idisc)%RotN(1)
-                     projected_y = ymesh-deltan*  actuatordisc(idisc)%RotN(2)
-                     projected_z = zmesh-deltan*(-actuatordisc(idisc)%RotN(3))
-
-                     ! deltar: distance between the wind turbine's centre and the projected point
-                     deltar = sqrt((projected_x-actuatordisc(idisc)%COR(1))**2+&
-                                   (projected_y-actuatordisc(idisc)%COR(2))**2+&
-                                   (projected_z-actuatordisc(idisc)%COR(3))**2)
-
-                     ! Compute Gamma [smearing using super-Gaussian functions, see also King et al. (2017) Wind Energ. Sci., 2, 115-131]
-                     GammaDisc(i,j,k,idisc)=exp( -(deltan/(disc_thick/2.0))**2.0 -(deltar/(actuatordisc(idisc)%D/2.0))**8.0 )
-                     GammaDisc_partial=GammaDisc_partial + GammaDisc(i,j,k,idisc)
-                  enddo
-               enddo
-            enddo
-
-            call MPI_ALLREDUCE(GammaDisc_partial,GammaDisc_tot,1,real_type,MPI_SUM,MPI_COMM_WORLD,ierr)
-            GammaDisc(:,:,:,idisc)=GammaDisc(:,:,:,idisc)/GammaDisc_tot
-            !if (nrank==0) then
-            !   write(*,*) 'Disc thickness :', disc_thick
-            !   write(*,*) 'Total Gamma volume: ', GammaDisc_tot*dx*dy*dz
-            !   write(*,*) 'Approx. disc volume: ', actuatordisc(idisc)%Area*disc_thick
-            !endif
-         enddo
-
-      endif
-
-      return
-
-    end subroutine actuator_disc_model_compute_gamma
-
-    !*******************************************************************************
-    !
     subroutine actuator_disc_model_compute_source(ux1,uy1,uz1)
     !
     !*******************************************************************************
         
       use decomp_2d, only: xsize
       use MPI
-      use param, only: dx, dy, dz, dt, itime, initstat, rho_air, T_relax, dBL, ustar, icontrolfreq
+      use param, only: dx, dy, dz, dt, t, itime, initstat, rho_air, T_relax, dBL, ustar
       use var, only: Fdiscx, Fdiscy, Fdiscz, GammaDisc
         
       implicit none
       real(mytype), dimension(xsize(1),xsize(2),xsize(3)) :: ux1, uy1, uz1       
-      real(mytype) :: uave, CTprime, alpha_relax
+      real(mytype) :: uave, CTprime, alpha_relax, pert, dtp
       real(mytype), allocatable, dimension(:) :: Udisc_partial
       integer :: i, j, k, idisc, ierr
 
@@ -337,20 +303,40 @@ contains
          Fdiscx(:,:,:)=Fdiscx(:,:,:)-actuatordisc(idisc)%Thrust*GammaDisc(:,:,:,idisc)*actuatordisc(idisc)%RotN(1)/(dx*dy*dz)
          Fdiscy(:,:,:)=Fdiscy(:,:,:)-actuatordisc(idisc)%Thrust*GammaDisc(:,:,:,idisc)*actuatordisc(idisc)%RotN(2)/(dx*dy*dz)
          Fdiscz(:,:,:)=Fdiscz(:,:,:)-actuatordisc(idisc)%Thrust*GammaDisc(:,:,:,idisc)*(-actuatordisc(idisc)%RotN(3))/(dx*dy*dz)
+         ! Add the perturbation mimicking disc vibration
+         if (actuatordisc(idisc)%PertAmp/=0.) then
+            if (actuatordisc(idisc)%PertBand==0..or.actuatordisc(idisc)%PertTime<0.) then
+               actuatordisc(idisc)%PertTheta=2._mytype*pi*actuatordisc(idisc)%PertFreq*t+actuatordisc(idisc)%PertPhase
+            else
+               ! Phase diffusion: Lorentzian spectrum centred at PertFreq with full width PertBand
+               dtp=t-actuatordisc(idisc)%PertTime
+               actuatordisc(idisc)%PertTheta=actuatordisc(idisc)%PertTheta+2._mytype*pi*actuatordisc(idisc)%PertFreq*dtp+&
+                    sqrt(2._mytype*pi*actuatordisc(idisc)%PertBand*dtp)*gauss_random(actuatordisc(idisc)%RngState)
+            endif
+            actuatordisc(idisc)%PertTime=t
+            pert=actuatordisc(idisc)%PertAmp*actuatordisc(idisc)%Thrust*sin(actuatordisc(idisc)%PertTheta)/(dx*dy*dz)
+            if (actuatordisc(idisc)%PertDir==0) then
+               ! Axial: local thrust fluctuation at the disc edge
+               Fdiscx(:,:,:)=Fdiscx(:,:,:)-pert*GammaPert(:,:,:,idisc)*actuatordisc(idisc)%RotN(1)
+               Fdiscy(:,:,:)=Fdiscy(:,:,:)-pert*GammaPert(:,:,:,idisc)*actuatordisc(idisc)%RotN(2)
+               Fdiscz(:,:,:)=Fdiscz(:,:,:)-pert*GammaPert(:,:,:,idisc)*(-actuatordisc(idisc)%RotN(3))
+            else
+               ! Transverse: side force over the whole disc (sway), net force PertAmp*Thrust
+               Fdiscx(:,:,:)=Fdiscx(:,:,:)+pert*GammaDisc(:,:,:,idisc)*actuatordisc(idisc)%PertVec(1)
+               Fdiscy(:,:,:)=Fdiscy(:,:,:)+pert*GammaDisc(:,:,:,idisc)*actuatordisc(idisc)%PertVec(2)
+               Fdiscz(:,:,:)=Fdiscz(:,:,:)+pert*GammaDisc(:,:,:,idisc)*actuatordisc(idisc)%PertVec(3)
+            endif
+         endif
       enddo
         
-      ! compute statistics
-      do idisc=1,Nad
-          ! reset statistics
-          if (mod(itime,icontrolfreq)==1) then
-              actuatordisc(idisc)%Udisc_ave = 0.0_mytype
-              actuatordisc(idisc)%Power_ave = 0.0_mytype
-              actuatordisc(idisc)%Thrust_ave = 0.0_mytype
-          end if
-          actuatordisc(idisc)%Udisc_ave=actuatordisc(idisc)%Udisc_ave+actuatordisc(idisc)%UF
-          actuatordisc(idisc)%Power_ave=actuatordisc(idisc)%Power_ave+actuatordisc(idisc)%Power
-          actuatordisc(idisc)%Thrust_ave=actuatordisc(idisc)%Thrust_ave+actuatordisc(idisc)%Thrust
-      enddo
+      ! Compute statistics
+      if (itime>=initstat) then
+         do idisc=1,Nad
+            actuatordisc(idisc)%Udisc_ave=actuatordisc(idisc)%Udisc_ave+actuatordisc(idisc)%UF
+            actuatordisc(idisc)%Power_ave=actuatordisc(idisc)%Power_ave+actuatordisc(idisc)%Power
+            actuatordisc(idisc)%Thrust_ave=actuatordisc(idisc)%Thrust_ave+actuatordisc(idisc)%Thrust 
+         enddo
+      endif
 
       return
 
@@ -362,7 +348,7 @@ contains
     !
     !*******************************************************************************
 
-      use param, only: itime, initstat, icontrolfreq, dt
+      use param, only: itime, initstat, dt
 
       implicit none
       integer, intent(in) :: dump_no
@@ -381,15 +367,13 @@ contains
                           actuatordisc(idisc)%UF,&
                           actuatordisc(idisc)%Power,&
                           actuatordisc(idisc)%Thrust,&
-                          actuatordisc(idisc)%Udisc_ave/(mod(itime-1,icontrolfreq)+1),&
-                          actuatordisc(idisc)%Power_ave/(mod(itime-1,icontrolfreq)+1),&
-                          actuatordisc(idisc)%Thrust_ave/(mod(itime-1,icontrolfreq)+1),&
+                          actuatordisc(idisc)%Udisc_ave/(itime-initstat+1),&
+                          actuatordisc(idisc)%Power_ave/(itime-initstat+1),&
+                          actuatordisc(idisc)%Thrust_ave/(itime-initstat+1),&
                           actuatordisc(idisc)%alpha,&
                           actuatordisc(idisc)%YawAng,&
                           actuatordisc(idisc)%TiltAng
              close(2020)
-
-
          enddo
       endif
 
@@ -397,54 +381,35 @@ contains
 
     end subroutine actuator_disc_model_write_output
 
-
     !*******************************************************************************
     !
-    subroutine actuator_disc_model_smartredis_output()
+    function gauss_random(state)
     !
     !*******************************************************************************
-
-      use param, only: itime, initstat, dt, icontrolfreq
-      use MPI
+    ! Standard normal random number (xorshift64 + Box-Muller). Independent of the
+    ! intrinsic random_number, so all ranks draw the same sequence from the same state.
 
       implicit none
-      integer :: idisc,result,ierr
-      real(kind=c_double), dimension(Nad) :: AllPowers
-      real(kind=c_double), dimension(1) :: simulation_done, controller_done
+      integer(8), intent(inout) :: state
+      real(mytype) :: gauss_random, u1, u2
 
-      if (Nad>0) then
-          AllPowers = [(ActuatorDisc(idisc)%Power_ave/icontrolfreq, idisc=1,Nad)]
-          if (nrank==0) then
-              result = client%put_tensor(trim(name_prefix)//'_turbine_powers', AllPowers, shape(AllPowers))
-              if (result /= 0) then
-                  write(*,*) 'SmartRedis write failed'
-                  call MPI_ABORT(MPI_COMM_WORLD, result, ierr)
-              endif
-          endif
-      endif
+      u1=(real(ishft(xorshift(state),-11),mytype)+1._mytype)*2._mytype**(-53)
+      u2=real(ishft(xorshift(state),-11),mytype)*2._mytype**(-53)
+      gauss_random=sqrt(-2._mytype*log(u1))*cos(2._mytype*pi*u2)
 
-      controller_done(1) = 0
-      if (nrank==0) then
-          write(*,*) 'setting smartredis controller_done = 0'
-          result = client%put_tensor(trim(name_prefix)//'_yaws_done', controller_done, shape(controller_done))
-          if (result /= 0) then
-              write(*,*) 'SmartRedis write failed'
-              call MPI_ABORT(MPI_COMM_WORLD, result, ierr)
-          endif
-      end if
+    end function gauss_random
 
-      simulation_done(1) = 1
-      if (nrank==0) then
-          write (*,*) 'setting smartredis simulation_done = 1'
-          result = client%put_tensor(trim(name_prefix)//'_sim_done', simulation_done, shape(simulation_done))
-          if (result /= 0) then
-              write(*,*) 'SmartRedis write failed'
-              call MPI_ABORT(MPI_COMM_WORLD, result, ierr)
-          endif
-      endif
+    function xorshift(state)
 
-      return
+      implicit none
+      integer(8), intent(inout) :: state
+      integer(8) :: xorshift
 
-    end subroutine actuator_disc_model_smartredis_output
+      state=ieor(state,ishft(state,13))
+      state=ieor(state,ishft(state,-7))
+      state=ieor(state,ishft(state,17))
+      xorshift=state
+
+    end function xorshift
 
 end module actuator_disc_model
