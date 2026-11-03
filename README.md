@@ -43,10 +43,27 @@ it is possible to customise the coefficients of the second derivative schemes (u
 to add extra numerical dissipation in the simulation as a substitute of the missing dissipation 
 from the small turbulent scales that are not resolved. 
 
+## ADM perturbation realisations
+
+For finite-bandwidth forcing (`PertBand > 0` in the ADM coordinates file), the
+phase-diffusion seed depends on the `ADMParam` environment `instance`, disc ID and
+initialisation timestep. Use a distinct `instance` for each parallel environment.
+All MPI ranks within an environment use the same seed, independent of rank count.
+The same instance, disc and timestep reproduce the same random sequence; this
+does not make the background inflow noise reproducible.
+
+The specified initial `PertPhase` is unchanged. Pure sinusoidal forcing
+(`PertBand = 0`) remains identical across environments with identical parameters.
+This change does not restore RNG state from checkpoints or affect running jobs;
+new runs require a rebuilt solver.
+
+Run the focused seed regression tests with
+`python -m unittest discover -s test -p 'test_adm_forcing_seed.py'` (requires
+`gfortran`).
+
 Documentation
 =============
 
 [Readthedocs](https://xcompact3d.readthedocs.io/en/latest/)
-
 
 

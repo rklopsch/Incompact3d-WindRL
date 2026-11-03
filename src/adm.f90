@@ -132,8 +132,8 @@ contains
             ActuatorDisc(idisc)%PertPhase=0.
             ActuatorDisc(idisc)%PertAzim=0.
             ActuatorDisc(idisc)%PertBand=0.
-            ! Same seed on all ranks; differs between discs and after a restart
-            ActuatorDisc(idisc)%RngState=88172645463325252_8+1000003_8*idisc+itime
+            ! Rank-independent seed; distinct reproducible forcing for each environment.
+            ActuatorDisc(idisc)%RngState=88172645463325252_8+1000000007_8*int(instance,8)+1000003_8*idisc+itime
             read(Readline,*,iostat=ios) dummy,pert_real(1),pert_real(2),pert_int(1),pert_int(2),pert_real(3),pert_real(4),pert_real(5),&
                                         pert_real(6)
             if (ios==0) then
