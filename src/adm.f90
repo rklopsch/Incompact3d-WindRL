@@ -12,6 +12,21 @@ module actuator_disc_model
     use smartredis_client, only : client_type
 
     implicit none
+
+    type, bind(C), private :: poll_timespec
+        integer(c_long) :: seconds
+        integer(c_long) :: nanoseconds
+    end type poll_timespec
+
+    interface
+        function poll_nanosleep(requested, remaining) bind(C, name='nanosleep') result(status)
+            import c_int, poll_timespec
+            type(poll_timespec), intent(in) :: requested
+            type(poll_timespec), intent(out) :: remaining
+            integer(c_int) :: status
+        end function poll_nanosleep
+    end interface
+    private :: poll_nanosleep
     
 type ActuatorDiscType
     integer :: ID                       ! Actuator disc ID
@@ -153,27 +168,50 @@ contains
       real(mytype) :: xmesh,ymesh,zmesh,deltax,deltay,deltaz,deltan,deltar,disc_thick,hgrid,projected_x,projected_y,projected_z
       real(kind=c_double), dimension(Ndiscs) :: AllYawAngs
       real(kind=c_double), dimension(1) :: controller_done
+      integer :: yaw_mpi_type
+      type(poll_timespec) :: poll_delay, remaining_delay
 
       ! Specify the actuator discs
       Nad=Ndiscs
-      controller_done(1) = 0
-      do while (int(controller_done(1)) == 0)
-          result = client%unpack_tensor(trim(name_prefix)//'_yaws_done', controller_done, shape(controller_done))
-      end do
-      if (result /= 0) then
-          write(*,*) 'SmartRedis read failed'
+      if (nrank==0) then
+          controller_done(1) = 0
+          poll_delay = poll_timespec(0_c_long, 1000000_c_long)
+          do while (int(controller_done(1)) == 0)
+              result = client%unpack_tensor(trim(name_prefix)//'_yaws_done', controller_done, shape(controller_done))
+              if (result /= 0) then
+                  write(*,*) 'SmartRedis yaw-ready read failed'
+                  call MPI_ABORT(MPI_COMM_WORLD, result, ierr)
+              endif
+              if (int(controller_done(1)) == 0) then
+                  result = poll_nanosleep(poll_delay, remaining_delay)
+                  if (result /= 0) then
+                      write(*,*) 'SmartRedis polling sleep failed'
+                      call MPI_ABORT(MPI_COMM_WORLD, 1, ierr)
+                  endif
+              endif
+          end do
+
+          if (Nad>0) then
+              result = client%unpack_tensor(trim(name_prefix)//'_yaws', AllYawAngs, shape(AllYawAngs))
+              if (result /= 0) then
+                  write(*,*) 'SmartRedis yaw read failed'
+                  call MPI_ABORT(MPI_COMM_WORLD, result, ierr)
+              endif
+          endif
+      endif
+
+      call MPI_TYPE_MATCH_SIZE(MPI_TYPECLASS_REAL, int(c_sizeof(controller_done(1))), yaw_mpi_type, result)
+      if (result /= MPI_SUCCESS) then
+          write(*,*) 'MPI yaw datatype lookup failed'
+          call MPI_ABORT(MPI_COMM_WORLD, result, ierr)
+      endif
+      call MPI_BCAST(AllYawAngs, Nad, yaw_mpi_type, 0, MPI_COMM_WORLD, result)
+      if (result /= MPI_SUCCESS) then
+          write(*,*) 'MPI yaw broadcast failed'
           call MPI_ABORT(MPI_COMM_WORLD, result, ierr)
       endif
 
       if (Nad>0) then
-!          write(*,*) 'Reading yaw angles from smartredis database'
-          ! Read the disc data
-          ! Fill AllYawAngs with YawAng values from each ActuatorDisc
-          result = client%unpack_tensor(trim(name_prefix)//'_yaws', AllYawAngs, shape(AllYawAngs))
-          if (result /= 0) then
-              write(*,*) 'SmartRedis read failed'
-              call MPI_ABORT(MPI_COMM_WORLD, result, ierr)
-          endif
           do idisc=1,Nad
               ActuatorDisc(idisc)%YawAng = AllYawAngs(idisc)
               ActuatorDisc(idisc)%RotN(1)=cos(ActuatorDisc(idisc)%YawAng*conrad)*cos(ActuatorDisc(idisc)%TiltAng*conrad)
